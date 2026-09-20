@@ -1,0 +1,10 @@
+fastapi==0.141.1
+uvicorn==0.53.0
+sqlalchemy==2.0.54
+pydantic==2.13.5
+requests==2.34.2
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart
+psycopg2-binary
+gunicorn
