@@ -19,6 +19,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# CORS: izinkan akses dari mana saja
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,6 +32,7 @@ app.add_middleware(
 # ==================== HELPER ====================
 
 def hash_password(password: str) -> str:
+    """Hash password pakai bcrypt langsung (tanpa passlib)"""
     password_bytes = password.encode('utf-8')[:72]
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(password_bytes, salt)
@@ -38,6 +40,7 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
+    """Verifikasi password dengan hash yang tersimpan"""
     try:
         password_bytes = plain.encode('utf-8')[:72]
         hashed_bytes = hashed.encode('utf-8')
@@ -53,17 +56,22 @@ def read_root():
     return {
         "message": "Student Activity API - Capstone Big Data",
         "status": "online",
-        "docs": "/docs"
+        "docs": "/docs",
+        "health": "/health",
+        "stats": "/api/stats",
+        "kafka_format": "/api/activities/kafka-format/since/{last_id}"
     }
 
 
 @app.get("/health")
 def health_check():
+    """Endpoint untuk cek status server"""
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 
 @app.post("/api/register")
 def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
+    """Registrasi siswa baru"""
     db_user = db.query(models.User).filter(models.User.username == user.username).first()
     if db_user:
         raise HTTPException(status_code=400, detail="Username sudah terdaftar")
@@ -85,6 +93,7 @@ def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/api/login")
 def login(user: schemas.UserCreate, request: Request, db: Session = Depends(get_db)):
+    """Login siswa dan catat aktivitas login"""
     db_user = db.query(models.User).filter(models.User.username == user.username).first()
     
     if not db_user or not verify_password(user.password, db_user.password_hash):
@@ -113,6 +122,7 @@ def create_activity(
     request: Request,
     db: Session = Depends(get_db)
 ):
+    """Catat aktivitas siswa"""
     db_user = db.query(models.User).filter(models.User.username == activity.username).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User tidak ditemukan")
@@ -136,8 +146,11 @@ def create_activity(
     return new_activity
 
 
+# ==================== ENDPOINTS UNTUK TIM LAIN ====================
+
 @app.get("/api/activities/recent")
 def get_recent_activities(limit: int = 100, db: Session = Depends(get_db)):
+    """Ambil aktivitas terbaru"""
     activities = db.query(models.Activity).order_by(
         models.Activity.id.desc()
     ).limit(limit).all()
@@ -161,6 +174,7 @@ def get_recent_activities(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/api/activities/since/{last_id}")
 def get_activities_since(last_id: int, db: Session = Depends(get_db)):
+    """Ambil aktivitas baru setelah ID tertentu (format standar)"""
     activities = db.query(models.Activity).filter(
         models.Activity.id > last_id
     ).order_by(models.Activity.id.asc()).limit(1000).all()
@@ -182,8 +196,70 @@ def get_activities_since(last_id: int, db: Session = Depends(get_db)):
     return result
 
 
+@app.get("/api/activities/kafka-format/since/{last_id}")
+def get_activities_kafka_format(last_id: int, db: Session = Depends(get_db)):
+    """
+    Ambil aktivitas baru dalam FORMAT KAFKA.
+    
+    Endpoint ini khusus untuk tim Kafka Producer.
+    Response sudah sesuai format producer.py mereka:
+    {
+      "source": "student_performance",
+      "data_type": "structured",
+      "data": {
+        "student_id": "S0005",
+        "name": "siswa4",
+        "course": "Big Data",
+        "activity_type": "mengerjakan_kuis",
+        "timestamp": "...",
+        "score": 85
+      }
+    }
+    
+    Tim tinggal polling endpoint ini dan forward langsung ke Kafka.
+    """
+    activities = db.query(models.Activity).filter(
+        models.Activity.id > last_id
+    ).order_by(models.Activity.id.asc()).limit(1000).all()
+    
+    result = []
+    for act in activities:
+        # Parse metadata untuk ambil score
+        metadata = None
+        score = None
+        if act.metadata_json:
+            try:
+                metadata = json.loads(act.metadata_json)
+                score = metadata.get("score") if isinstance(metadata, dict) else None
+            except Exception:
+                metadata = None
+        
+        # Format Kafka
+        kafka_event = {
+            "source": "student_performance",
+            "data_type": "structured",
+            "data": {
+                "event_id": act.id,
+                "student_id": f"S{str(act.user_id).zfill(4)}",
+                "name": act.owner.username,
+                "course": "Big Data",
+                "activity_type": act.activity_type,
+                "timestamp": act.timestamp.isoformat(),
+                "score": score,
+                "session_id": act.session_id,
+                "device": act.device,
+                "ip_address": act.ip_address,
+                "metadata": metadata
+            }
+        }
+        result.append(kafka_event)
+    
+    return result
+
+
 @app.get("/api/stats")
 def get_stats(db: Session = Depends(get_db)):
+    """Statistik umum untuk dashboard"""
     total_users = db.query(models.User).count()
     total_activities = db.query(models.Activity).count()
     last_activity = db.query(models.Activity).order_by(
