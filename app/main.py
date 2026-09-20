@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from passlib.context import CryptContext
 from datetime import datetime
 import json
+import bcrypt
 
 from . import models, schemas
 from .database import engine, get_db
@@ -12,9 +12,6 @@ from .database import engine, get_db
 # Buat tabel di database saat aplikasi pertama kali jalan
 models.Base.metadata.create_all(bind=engine)
 
-# Setup password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 app = FastAPI(
     title="Student Activity API",
@@ -22,10 +19,9 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS: izinkan akses dari mana saja (nanti bisa dipersempit)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Ganti dengan domain spesifik untuk production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,11 +31,19 @@ app.add_middleware(
 # ==================== HELPER ====================
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    password_bytes = password.encode('utf-8')[:72]
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password_bytes, salt)
+    return hashed.decode('utf-8')
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        password_bytes = plain.encode('utf-8')[:72]
+        hashed_bytes = hashed.encode('utf-8')
+        return bcrypt.checkpw(password_bytes, hashed_bytes)
+    except Exception:
+        return False
 
 
 # ==================== ENDPOINTS ====================
@@ -55,19 +59,15 @@ def read_root():
 
 @app.get("/health")
 def health_check():
-    """Endpoint untuk cek status server"""
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 
 @app.post("/api/register")
 def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
-    """Registrasi siswa baru"""
-    # Cek apakah username sudah ada
     db_user = db.query(models.User).filter(models.User.username == user.username).first()
     if db_user:
         raise HTTPException(status_code=400, detail="Username sudah terdaftar")
     
-    # Hash password sebelum disimpan
     new_user = models.User(
         username=user.username,
         password_hash=hash_password(user.password)
@@ -85,13 +85,11 @@ def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/api/login")
 def login(user: schemas.UserCreate, request: Request, db: Session = Depends(get_db)):
-    """Login siswa dan catat aktivitas login"""
     db_user = db.query(models.User).filter(models.User.username == user.username).first()
     
     if not db_user or not verify_password(user.password, db_user.password_hash):
         raise HTTPException(status_code=401, detail="Username atau password salah")
     
-    # Catat aktivitas login
     client_ip = request.client.host if request.client else None
     new_activity = models.Activity(
         user_id=db_user.id,
@@ -115,17 +113,12 @@ def create_activity(
     request: Request,
     db: Session = Depends(get_db)
 ):
-    """Catat aktivitas siswa (dipanggil oleh bot atau siswa asli)"""
-    # Cari user
     db_user = db.query(models.User).filter(models.User.username == activity.username).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User tidak ditemukan")
     
-    # Auto-fill IP dan device kalau tidak ada
     client_ip = activity.ip_address or (request.client.host if request.client else None)
     device = activity.device or request.headers.get("user-agent", "unknown")[:100]
-    
-    # Simpan metadata sebagai JSON string
     metadata_str = json.dumps(activity.metadata) if activity.metadata else None
     
     new_activity = models.Activity(
@@ -143,19 +136,12 @@ def create_activity(
     return new_activity
 
 
-# ==================== ENDPOINTS UNTUK TIM LAIN ====================
-
 @app.get("/api/activities/recent")
 def get_recent_activities(limit: int = 100, db: Session = Depends(get_db)):
-    """
-    Ambil aktivitas terbaru (untuk tim lain / dashboard)
-    Ini yang akan dipolling oleh Producer Kafka tim lain.
-    """
     activities = db.query(models.Activity).order_by(
         models.Activity.id.desc()
     ).limit(limit).all()
     
-    # Join dengan user untuk dapat username
     result = []
     for act in activities:
         result.append({
@@ -175,12 +161,6 @@ def get_recent_activities(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/api/activities/since/{last_id}")
 def get_activities_since(last_id: int, db: Session = Depends(get_db)):
-    """
-    Ambil aktivitas baru setelah ID tertentu.
-    Ini yang akan dipolling terus-menerus oleh Producer Kafka tim lain.
-    
-    Contoh: GET /api/activities/since/50 → ambil semua aktivitas dengan id > 50
-    """
     activities = db.query(models.Activity).filter(
         models.Activity.id > last_id
     ).order_by(models.Activity.id.asc()).limit(1000).all()
@@ -204,7 +184,6 @@ def get_activities_since(last_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/stats")
 def get_stats(db: Session = Depends(get_db)):
-    """Statistik umum untuk dashboard"""
     total_users = db.query(models.User).count()
     total_activities = db.query(models.Activity).count()
     last_activity = db.query(models.Activity).order_by(
